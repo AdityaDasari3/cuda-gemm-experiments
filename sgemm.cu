@@ -1,9 +1,11 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iostream>
 #include <runner.cuh>
+#include <tuple>
 #include <vector>
 
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
@@ -11,158 +13,370 @@
 const std::string errLogFile = "matrixValidationFailure.txt";
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    std::cerr << "Please select a kernel (range 0 - 12, 0 for NVIDIA cuBLAS)"
-              << std::endl;
+  // Usage:
+  // ./sgemm <kernel>
+  //     -> runs the original square-size sweep
+  //
+  // ./sgemm <kernel> <M> <N> <K>
+  //     -> runs one arbitrary GEMM:
+  //        A[M x K] * B[K x N] = C[M x N]
+
+  if (argc != 2 && argc != 5) {
+    std::cerr << "Usage:\n"
+              << "  ./sgemm <kernel>\n"
+              << "  ./sgemm <kernel> <M> <N> <K>\n"
+              << "Kernel range: 0-12 (0 = NVIDIA cuBLAS)\n";
     exit(EXIT_FAILURE);
   }
 
-  // get kernel number
+  // Get kernel number
   int kernel_num = std::stoi(argv[1]);
+
   if (kernel_num < 0 || kernel_num > 12) {
     std::cerr << "Please enter a valid kernel number (0-12)" << std::endl;
     exit(EXIT_FAILURE);
   }
 
-  // get environment variable for device
+  // ------------------------------------------------------------
+  // Build list of test matrix dimensions
+  // ------------------------------------------------------------
+
+  std::vector<std::tuple<int, int, int>> TESTS;
+
+  if (argc == 5) {
+    int M = std::stoi(argv[2]);
+    int N = std::stoi(argv[3]);
+    int K = std::stoi(argv[4]);
+
+    if (M <= 0 || N <= 0 || K <= 0) {
+      std::cerr << "M, N and K must all be positive integers." << std::endl;
+      exit(EXIT_FAILURE);
+    }
+
+    TESTS.push_back({M, N, K});
+
+  } else {
+    // Original square benchmark sweep
+    std::vector<int> SIZE = {128, 256, 512, 1024, 2048, 4096};
+
+    for (int size : SIZE) {
+      TESTS.push_back({size, size, size});
+    }
+  }
+
+  // ------------------------------------------------------------
+  // Select GPU
+  // ------------------------------------------------------------
+
   int deviceIdx = 0;
+
   if (getenv("DEVICE") != NULL) {
     deviceIdx = atoi(getenv("DEVICE"));
   }
+
   cudaCheck(cudaSetDevice(deviceIdx));
 
   printf("Running kernel %d on device %d.\n", kernel_num, deviceIdx);
 
-  // print some device info
+  // Uncomment if you want detailed GPU information
   // CudaDeviceInfo();
 
-  // Declare the handle, create the handle, cublasCreate will return a value of
-  // type cublasStatus_t to determine whether the handle was created
-  // successfully (the value is 0)
-  cublasHandle_t handle;
-  if (cublasCreate(&handle)) {
-    std::cerr << "Create cublas handle error." << std::endl;
-    exit(EXIT_FAILURE);
-  };
+  // ------------------------------------------------------------
+  // Create cuBLAS handle
+  // ------------------------------------------------------------
 
-  // Using cudaEvent for gpu stream timing, cudaEvent is equivalent to
-  // publishing event tasks in the target stream
+  cublasHandle_t handle;
+
+  if (cublasCreate(&handle)) {
+    std::cerr << "Create cuBLAS handle error." << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  // ------------------------------------------------------------
+  // CUDA events used for GPU timing
+  // ------------------------------------------------------------
+
   float elapsed_time;
+
   cudaEvent_t beg, end;
   cudaEventCreate(&beg);
   cudaEventCreate(&end);
 
-  // cuBLAS FLOPs ceiling is reached at 8192
-  std::vector<int> SIZE = {128, 256, 512, 1024, 2048, 4096};
+  // ------------------------------------------------------------
+  // Determine maximum memory needed across all tests
+  //
+  // A = M x K
+  // B = K x N
+  // C = M x N
+  // ------------------------------------------------------------
 
-  long m, n, k, max_size;
-  max_size = SIZE[SIZE.size() - 1];
-  std::cout << "Max size: " << max_size << std::endl;
+  size_t maxA = 0;
+  size_t maxB = 0;
+  size_t maxC = 0;
 
-  float alpha = 0.5, beta = 3.0; // GEMM input parameters, C=α*AB+β*C
+  for (const auto &[M, N, K] : TESTS) {
+    maxA = std::max(maxA, static_cast<size_t>(M) * K);
+    maxB = std::max(maxB, static_cast<size_t>(K) * N);
+    maxC = std::max(maxC, static_cast<size_t>(M) * N);
+  }
 
-  float *A = nullptr, *B = nullptr, *C = nullptr,
-        *C_ref = nullptr; // host matrices
-  float *dA = nullptr, *dB = nullptr, *dC = nullptr,
-        *dC_ref = nullptr; // device matrices
+  std::cout << "Maximum allocated elements:"
+            << " A=" << maxA
+            << ", B=" << maxB
+            << ", C=" << maxC << std::endl;
 
-  A = (float *)malloc(sizeof(float) * max_size * max_size);
-  B = (float *)malloc(sizeof(float) * max_size * max_size);
-  C = (float *)malloc(sizeof(float) * max_size * max_size);
-  C_ref = (float *)malloc(sizeof(float) * max_size * max_size);
+  float alpha = 0.5f;
+  float beta = 3.0f; // C = alpha * A*B + beta * C
 
-  randomize_matrix(A, max_size * max_size);
-  randomize_matrix(B, max_size * max_size);
-  randomize_matrix(C, max_size * max_size);
+  // ------------------------------------------------------------
+  // Host matrices
+  // ------------------------------------------------------------
 
-  cudaCheck(cudaMalloc((void **)&dA, sizeof(float) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dB, sizeof(float) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dC, sizeof(float) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(float) * max_size * max_size));
+  float *A = nullptr;
+  float *B = nullptr;
+  float *C = nullptr;
+  float *C_ref = nullptr;
 
-  cudaCheck(cudaMemcpy(dA, A, sizeof(float) * max_size * max_size,
+  A = static_cast<float *>(malloc(sizeof(float) * maxA));
+  B = static_cast<float *>(malloc(sizeof(float) * maxB));
+  C = static_cast<float *>(malloc(sizeof(float) * maxC));
+  C_ref = static_cast<float *>(malloc(sizeof(float) * maxC));
+
+  if (!A || !B || !C || !C_ref) {
+    std::cerr << "Host memory allocation failed." << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  randomize_matrix(A, static_cast<int>(maxA));
+  randomize_matrix(B, static_cast<int>(maxB));
+  randomize_matrix(C, static_cast<int>(maxC));
+
+  // C_ref must initially contain the same values as C
+  copy_matrix(C, C_ref, static_cast<int>(maxC));
+
+  // ------------------------------------------------------------
+  // Device matrices
+  // ------------------------------------------------------------
+
+  float *dA = nullptr;
+  float *dB = nullptr;
+  float *dC = nullptr;
+  float *dC_ref = nullptr;
+
+  cudaCheck(cudaMalloc(reinterpret_cast<void **>(&dA),
+                       sizeof(float) * maxA));
+
+  cudaCheck(cudaMalloc(reinterpret_cast<void **>(&dB),
+                       sizeof(float) * maxB));
+
+  cudaCheck(cudaMalloc(reinterpret_cast<void **>(&dC),
+                       sizeof(float) * maxC));
+
+  cudaCheck(cudaMalloc(reinterpret_cast<void **>(&dC_ref),
+                       sizeof(float) * maxC));
+
+  cudaCheck(cudaMemcpy(dA, A,
+                       sizeof(float) * maxA,
                        cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpy(dB, B, sizeof(float) * max_size * max_size,
-                       cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpy(dC, C, sizeof(float) * max_size * max_size,
-                       cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpy(dC_ref, C, sizeof(float) * max_size * max_size,
+
+  cudaCheck(cudaMemcpy(dB, B,
+                       sizeof(float) * maxB,
                        cudaMemcpyHostToDevice));
 
-  int repeat_times = 50;
-  for (int size : SIZE) {
-    m = n = k = size;
+  cudaCheck(cudaMemcpy(dC, C,
+                       sizeof(float) * maxC,
+                       cudaMemcpyHostToDevice));
 
-    std::cout << "dimensions(m=n=k) " << m << ", alpha: " << alpha
-              << ", beta: " << beta << std::endl;
-    // Verify the correctness of the calculation, and execute it once before the
-    // kernel function timing to avoid cold start errors
+  cudaCheck(cudaMemcpy(dC_ref, C_ref,
+                       sizeof(float) * maxC,
+                       cudaMemcpyHostToDevice));
+
+  // ------------------------------------------------------------
+  // Benchmark
+  // ------------------------------------------------------------
+
+  const int repeat_times = 50;
+
+  for (const auto &[M, N, K] : TESTS) {
+    long m = M;
+    long n = N;
+    long k = K;
+
+    std::cout << "\n----------------------------------------\n";
+    std::cout << "Dimensions: "
+              << "M=" << m
+              << ", N=" << n
+              << ", K=" << k
+              << ", alpha=" << alpha
+              << ", beta=" << beta
+              << std::endl;
+
+    // ----------------------------------------------------------
+    // Correctness verification
+    // ----------------------------------------------------------
+
     if (kernel_num != 0) {
-      run_kernel(0, m, n, k, alpha, dA, dB, beta, dC_ref,
-                 handle); // cuBLAS
-      run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC,
-                 handle); // Executes the kernel, modifies the result matrix
+      // dC and dC_ref must start from exactly the same C matrix
+      cudaCheck(cudaMemcpy(dC_ref, dC,
+                           sizeof(float) * m * n,
+                           cudaMemcpyDeviceToDevice));
+
+      // Reference result using cuBLAS
+      run_kernel(0,
+                 m, n, k,
+                 alpha,
+                 dA,
+                 dB,
+                 beta,
+                 dC_ref,
+                 handle);
+
+      // Our kernel
+      run_kernel(kernel_num,
+                 m, n, k,
+                 alpha,
+                 dA,
+                 dB,
+                 beta,
+                 dC,
+                 handle);
+
       cudaCheck(cudaDeviceSynchronize());
-      cudaCheck(cudaGetLastError()); // Check for async errors during kernel run
-      cudaMemcpy(C, dC, sizeof(float) * m * n, cudaMemcpyDeviceToHost);
-      cudaMemcpy(C_ref, dC_ref, sizeof(float) * m * n, cudaMemcpyDeviceToHost);
+      cudaCheck(cudaGetLastError());
+
+      cudaCheck(cudaMemcpy(C,
+                           dC,
+                           sizeof(float) * m * n,
+                           cudaMemcpyDeviceToHost));
+
+      cudaCheck(cudaMemcpy(C_ref,
+                           dC_ref,
+                           sizeof(float) * m * n,
+                           cudaMemcpyDeviceToHost));
 
       if (!verify_matrix(C_ref, C, m * n)) {
         std::cout
-            << "Failed to pass the correctness verification against NVIDIA "
-               "cuBLAS."
+            << "Failed to pass correctness verification against NVIDIA cuBLAS."
             << std::endl;
-        if (m <= 128) {
-          std::cout << " Logging faulty output into " << errLogFile << "\n";
+
+        if (m <= 128 && n <= 128 && k <= 128) {
+          std::cout << "Logging faulty output into "
+                    << errLogFile << "\n";
+
           std::ofstream fs;
           fs.open(errLogFile);
-          fs << "A:\n";
-          print_matrix(A, m, n, fs);
-          fs << "B:\n";
-          print_matrix(B, m, n, fs);
-          fs << "C:\n";
+
+          fs << "A (" << m << " x " << k << "):\n";
+          print_matrix(A, m, k, fs);
+
+          fs << "B (" << k << " x " << n << "):\n";
+          print_matrix(B, k, n, fs);
+
+          fs << "C (" << m << " x " << n << "):\n";
           print_matrix(C, m, n, fs);
-          fs << "Should:\n";
+
+          fs << "Reference (" << m << " x " << n << "):\n";
           print_matrix(C_ref, m, n, fs);
+
+          fs.close();
         }
+
         exit(EXIT_FAILURE);
       }
+
+      std::cout << "Correctness verification: PASSED" << std::endl;
+
+      // Restore dC to the reference result so both are synchronized
+      cudaCheck(cudaMemcpy(dC,
+                           dC_ref,
+                           sizeof(float) * m * n,
+                           cudaMemcpyDeviceToDevice));
     }
+
+    // ----------------------------------------------------------
+    // Performance benchmark
+    // ----------------------------------------------------------
 
     cudaEventRecord(beg);
-    for (int j = 0; j < repeat_times; j++) {
-      // We don't reset dC between runs to save time
-      run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC, handle);
-    }
-    cudaEventRecord(end);
-    cudaEventSynchronize(beg);
-    cudaEventSynchronize(end);
-    cudaEventElapsedTime(&elapsed_time, beg, end);
-    elapsed_time /= 1000.; // Convert to seconds
 
-    long flops = 2 * m * n * k;
+    for (int j = 0; j < repeat_times; j++) {
+      // We intentionally don't reset C between repetitions.
+      // Both runtime and FLOP/s are measured consistently.
+      run_kernel(kernel_num,
+                 m, n, k,
+                 alpha,
+                 dA,
+                 dB,
+                 beta,
+                 dC,
+                 handle);
+    }
+
+    cudaEventRecord(end);
+
+    cudaEventSynchronize(end);
+
+    cudaEventElapsedTime(&elapsed_time, beg, end);
+
+    // cudaEventElapsedTime gives milliseconds
+    elapsed_time /= 1000.0f;
+
+    const long long flops =
+        2LL * static_cast<long long>(m) *
+        static_cast<long long>(n) *
+        static_cast<long long>(k);
+
+    const double average_time =
+        elapsed_time / repeat_times;
+
+    const double gflops =
+        (repeat_times *
+         static_cast<double>(flops) *
+         1e-9) /
+        elapsed_time;
+
     printf(
-        "Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. size: "
-        "(%ld).\n",
-        elapsed_time / repeat_times,
-        (repeat_times * flops * 1e-9) / elapsed_time, m);
+        "Average elapsed time: (%7.6f) s, "
+        "performance: (%7.1f) GFLOPS. "
+        "M: (%ld), N: (%ld), K: (%ld).\n",
+        average_time,
+        gflops,
+        m,
+        n,
+        k);
+
     fflush(stdout);
-    // make dC and dC_ref equal again (we modified dC while calling our kernel
-    // for benchmarking)
-    cudaCheck(cudaMemcpy(dC, dC_ref, sizeof(float) * m * n,
-                         cudaMemcpyDeviceToDevice));
+
+    // Reset C after benchmarking so the next test starts cleanly
+    cudaCheck(cudaMemcpy(dC,
+                         C,
+                         sizeof(float) * m * n,
+                         cudaMemcpyHostToDevice));
+
+    cudaCheck(cudaMemcpy(dC_ref,
+                         C,
+                         sizeof(float) * m * n,
+                         cudaMemcpyHostToDevice));
   }
 
-  // Free up CPU and GPU space
+  // ------------------------------------------------------------
+  // Cleanup
+  // ------------------------------------------------------------
+
   free(A);
   free(B);
   free(C);
   free(C_ref);
+
   cudaFree(dA);
   cudaFree(dB);
   cudaFree(dC);
   cudaFree(dC_ref);
+
+  cudaEventDestroy(beg);
+  cudaEventDestroy(end);
+
   cublasDestroy(handle);
 
   return 0;
-};
+}
