@@ -11,4 +11,4 @@
 #include "kernels/6_kernel_vectorize.cuh"
 #include "kernels/7_kernel_resolve_bank_conflicts.cuh"
 #include "kernels/8_kernel_bank_extra_col.cuh"
-#include "kernels/9_kernel_autotuned.cuh"
+// #include "kernels/9_kernel_autotuned.cuh"
